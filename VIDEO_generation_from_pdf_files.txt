@@ -1,0 +1,828 @@
+############cat CORRECTED_script__COLOR.txt
+################## ~/.local/bin/streamlit run CORRECTED_script__COLOR.py
+import streamlit as st
+import os
+import json
+import tempfile
+import subprocess
+import shutil
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
+import requests
+from io import BytesIO
+import base64
+import asyncio
+import uuid
+import oracledb
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.vectorstores import OracleVS
+from langchain_community.vectorstores.utils import DistanceStrategy
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.schema import Document
+import PyPDF2
+import validators
+from bs4 import BeautifulSoup
+from langchain.prompts import PromptTemplate
+
+# Configuration
+GEMINI_MODEL = "gemini-1.5-pro"
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+
+# Add custom CSS for a colorful background
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #8EC5FC;
+        background-image: linear-gradient(62deg, #8EC5FC 0%, #E0C3FC 100%);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# Database Connection
+@st.cache_resource
+def get_db_connection():
+    return oracledb.connect(
+        user="sample",
+        password="Summer2025",
+        dsn="localhost:1521/freepdb1"
+    )
+
+# Initialize Embeddings
+@st.cache_resource
+def get_embeddings():
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # Create and set a new event loop if one doesn't exist
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001",
+        task_type="RETRIEVAL_DOCUMENT"
+    )
+    return embeddings
+
+# --- New Function to Delete Documents ---
+def delete_document_safe(conn, doc_id):
+    """Delete document and its embeddings from the database"""
+    try:
+        cur = conn.cursor()
+        
+        # Delete vector chunks first
+        try:
+            cur.execute("DELETE FROM video_chunks WHERE doc_id = :1", (doc_id,))
+            chunks_deleted = cur.rowcount
+            if chunks_deleted > 0:
+                st.info(f"Deleted {chunks_deleted} vector chunks associated with the document.")
+        except Exception as e:
+            st.warning(f"Could not delete vector chunks: {e}")
+        
+        # Delete document from processed_videos table
+        cur.execute("DELETE FROM processed_videos WHERE id = :1", (doc_id,))
+        docs_deleted = cur.rowcount
+        
+        if docs_deleted > 0:
+            conn.commit()
+            st.success("Document deleted successfully.")
+            return True
+        else:
+            st.warning("Document not found.")
+            return False
+            
+    except Exception as e:
+        st.error(f"Error deleting document: {str(e)}")
+        conn.rollback()
+        return False
+    finally:
+        cur.close()
+
+# --- Content processing functions (existing code) ---
+def save_document_to_db(conn, doc_id, title, doc_size, doc_type="pdf"):
+    """Save document to database"""
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO processed_videos (id, title, doc_size) 
+            VALUES (:1, :2, :3)
+        """, (doc_id, title, doc_size))
+        conn.commit()
+        st.success(f"Document '{title}' saved to database")
+        return True
+    except Exception as e:
+        st.error(f"Error saving document: {str(e)}")
+        conn.rollback()
+        return False
+    finally:
+        cur.close()
+
+def create_vector_embeddings(conn, doc_id, title, text):
+    """Create vector embeddings with proper distance strategy"""
+    try:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""]
+        )
+        chunks = text_splitter.split_text(text)
+        
+        st.info(f"Created {len(chunks)} chunks for vector storage")
+        
+        documents = []
+        for i, chunk in enumerate(chunks):
+            doc = Document(
+                page_content=chunk,
+                metadata={
+                    "doc_id": doc_id,
+                    "title": title,
+                    "chunk_index": i,
+                    "source": f"Document: {title}"
+                }
+            )
+            documents.append(doc)
+        
+        embeddings = get_embeddings()
+        
+        try:
+            # Try to add to existing vector store
+            vectorstore = OracleVS(
+                client=conn,
+                table_name="video_chunks",
+                embedding_function=embeddings,
+                distance_strategy=DistanceStrategy.COSINE
+            )
+            vectorstore.add_documents(documents)
+            st.success("Added to existing vector store")
+        except Exception as e1:
+            try:
+                # Create new vector store if it doesn't exist
+                st.info("Creating new vector store...")
+                vectorstore = OracleVS.from_documents(
+                    documents,
+                    embeddings,
+                    client=conn,
+                    table_name="video_chunks",
+                    distance_strategy=DistanceStrategy.COSINE
+                )
+                st.success("Created new vector store")
+            except Exception as e2:
+                st.error(f"Failed to create vector store: {str(e2)}")
+                return False
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"Error creating vector embeddings: {str(e)}")
+        return False
+
+def process_pdf_file(uploaded_file, conn):
+    """Process uploaded PDF file"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(uploaded_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        
+        if not text.strip():
+            st.error("Could not extract text from PDF")
+            return False, None, None, 0
+        
+        doc_id = str(uuid.uuid4())
+        title = uploaded_file.name.replace(".pdf", "")
+        doc_size = len(text)
+        
+        if save_document_to_db(conn, doc_id, title, doc_size):
+            success = create_vector_embeddings(conn, doc_id, title, text)
+            return success, doc_id, title, doc_size
+        
+        return False, None, None, 0
+        
+    except Exception as e:
+        st.error(f"Error processing PDF: {str(e)}")
+        return False, None, None, 0
+
+def process_web_content(url, conn):
+    """Process web content from URL"""
+    try:
+        if not validators.url(url):
+            st.error("Invalid URL format")
+            return False, None, None, 0
+            
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        text = soup.get_text()
+        
+        # Clean up text
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        if not text.strip():
+            st.error("Could not extract text from web page")
+            return False, None, None, 0
+        
+        doc_id = str(uuid.uuid4())
+        title = soup.title.string if soup.title else url
+        title = title[:100]
+        doc_size = len(text)
+
+        if save_document_to_db(conn, doc_id, title, doc_size):
+            success = create_vector_embeddings(conn, doc_id, title, text)
+            return success, doc_id, title, len(text)
+        
+        return False, None, None, 0
+        
+    except Exception as e:
+        st.error(f"Error processing web content: {str(e)}")
+        return False, None, None, 0
+
+def get_processed_videos(conn):
+    """Get list of all processed videos"""
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, title FROM processed_videos ORDER BY title DESC")
+        videos = cur.fetchall()
+        cur.close()
+        return videos
+    except Exception as e:
+        st.error(f"Error fetching videos: {str(e)}")
+        return []
+
+# --- Video Creation Agents (existing code) ---
+class VideoCreationAgents:
+    def __init__(self, rag_chain):
+        self.rag_chain = rag_chain
+        self.temp_dir = tempfile.mkdtemp()
+        self.ffmpeg_available = self._check_ffmpeg()
+        
+    def _check_ffmpeg(self):
+        try:
+            subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return True
+        except:
+            try:
+                subprocess.run(['/usr/local/bin/ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                return True
+            except:
+                return False
+    
+    def script_agent(self, topic, duration, style="educational"):
+        duration_mapping = {
+            "1-2 minutes": "90 seconds",
+            "3-5 minutes": "4 minutes", 
+            "5-10 minutes": "7 minutes"
+        }
+        actual_duration = duration_mapping.get(duration, "3 minutes")
+        
+        try:
+            # Step 1: Retrieve relevant context from the documents using the topic as a query.
+            rag_response = self.rag_chain.invoke({"query": topic})
+            retrieved_content = rag_response['result']
+            source_docs = rag_response['source_documents']
+
+            if not source_docs:
+                st.warning("No relevant documents found for the topic. Using general knowledge.")
+                script_prompt = f"""
+                    Create a detailed video script for a {actual_duration} video about: {topic}. 
+                    No documents were found, so use general knowledge.
+                    The script must be at least 600 words long.
+                    Structure the response with 5-8 distinct scenes.
+                    
+                    TITLE: [Video Title Here]
+                    HOOK: [Opening statement - ~30 seconds]
+                    SCENE 1: [~30 seconds]
+                    NARRATION: [What the narrator says]
+                    VISUAL: [What should be shown]
+    
+                    ...
+                    SCENE 8: [~30 seconds]
+                    NARRATION: [What the narrator says]
+                    VISUAL: [What should be shown]
+                    CONCLUSION: [Closing statement - ~30 seconds]
+                """
+            else:
+                # Step 2: Create a new, more informed prompt using the retrieved content.
+                script_prompt = f"""
+                    Create a detailed video script for a {actual_duration} video about: {topic}
+                    
+                    Use ONLY the following information from the documents provided below:
+                    
+                    <DOCUMENTS>
+                    {retrieved_content}
+                    </DOCUMENTS>
+                    
+                    The script must be at least 600 words long to ensure a full video.
+                    Structure the response with 5-8 distinct scenes based on the documents.
+                    
+                    TITLE: [Video Title Here]
+                    
+                    HOOK: [Opening statement - ~30 seconds]
+                    
+                    SCENE 1: [~30 seconds]
+                    NARRATION: [What the narrator says]
+                    VISUAL: [What should be shown]
+                    
+                    ...
+                    
+                    SCENE 8: [~30 seconds]
+                    NARRATION: [What the narrator says]
+                    VISUAL: [What should be shown]
+                    
+                    CONCLUSION: [Closing statement - ~30 seconds]
+    
+                    Make it engaging and based strictly on the provided document content.
+                    Include specific data, quotes, or examples from the documents.
+                """
+            
+            # Step 3: Generate the script using the new prompt.
+            llm = ChatGoogleGenerativeAI(
+                model=GEMINI_MODEL,
+                temperature=0.7,
+                convert_system_message_to_human=True
+            )
+            script_text = llm.invoke(script_prompt).content
+            
+            return self._parse_structured_script(script_text, topic)
+        except Exception as e:
+            st.error(f"Script generation error: {e}")
+            return None
+
+    def _parse_structured_script(self, script_text, topic):
+        # A simple parser for the structured script format
+        lines = script_text.strip().split('\n')
+        parsed_script = {
+            "title": "",
+            "scenes": [],
+            "conclusion": ""
+        }
+        
+        current_scene = None
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith("TITLE:"):
+                parsed_script["title"] = line.replace("TITLE:", "").strip()
+            elif line.startswith("HOOK:"):
+                current_scene = {
+                    "scene_number": 0,
+                    "duration_seconds": 30,
+                    "narration": "",
+                    "visual_description": "A dynamic opening visual."
+                }
+                parsed_script["scenes"].append(current_scene)
+                current_scene["narration"] = line.replace("HOOK:", "").strip()
+            elif line.startswith("SCENE"):
+                scene_info = self._parse_scenes_and_durations(line)
+                if scene_info:
+                    current_scene = {
+                        "scene_number": scene_info["scene_number"],
+                        "duration_seconds": scene_info["duration_seconds"],
+                        "narration": "",
+                        "visual_description": ""
+                    }
+                    parsed_script["scenes"].append(current_scene)
+            elif line.startswith("CONCLUSION:"):
+                parsed_script["conclusion"] = line.replace("CONCLUSION:", "").strip()
+            elif line.startswith("NARRATION:") and current_scene:
+                current_scene["narration"] += line.replace("NARRATION:", "").strip()
+            elif line.startswith("VISUAL:") and current_scene:
+                current_scene["visual_description"] += line.replace("VISUAL:", "").strip()
+
+        return parsed_script
+
+    def _parse_scenes_and_durations(self, line):
+        parts = line.split(":")
+        if len(parts) >= 2:
+            scene_part = parts[0].strip()
+            duration_part = parts[1].strip()
+            
+            scene_number = int(scene_part.replace("SCENE", "").strip())
+            duration_seconds = 20  # Default duration
+            if "~" in duration_part:
+                # Handle cases like "~30 seconds"
+                try:
+                    duration_seconds = int("".join(filter(str.isdigit, duration_part)))
+                except ValueError:
+                    pass  # Keep default
+            
+            return {
+                "scene_number": scene_number,
+                "duration_seconds": duration_seconds
+            }
+        return None
+
+    def visual_agent(self, script_data, visual_style="slides"):
+        visuals = []
+        
+        for scene in script_data.get('scenes', []):
+            if visual_style == "slides":
+                image_path = self._create_slide(
+                    scene['narration'], 
+                    scene['visual_description'],
+                    scene['scene_number']
+                )
+            elif visual_style == "charts":
+                image_path = self._create_chart(scene.get('key_points', ['Data']))
+            else:
+                image_path = self._create_text_image(scene['narration'])
+            
+            visuals.append({
+                "scene": scene['scene_number'],
+                "image_path": image_path,
+                "duration": scene['duration_seconds']
+            })
+        
+        return visuals
+    
+    def _create_slide(self, text, description, scene_num):
+        img = Image.new('RGB', (1920, 1080), color='#2E3440')
+        draw = ImageDraw.Draw(img)
+        
+        try:
+            font_title = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", 60)
+            font_body = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans.ttf", 40)
+        except:
+            font_title = ImageFont.load_default()
+            font_body = ImageFont.load_default()
+        
+        if font_title:
+            draw.text((100, 100), f"Scene {scene_num}", fill='#ECEFF4', font=font_title)
+        else:
+            draw.text((100, 100), f"Scene {scene_num}", fill='#ECEFF4')
+        
+        words = text.split()
+        lines = []
+        current_line = []
+        
+        for word in words:
+            current_line.append(word)
+            line_text = ' '.join(current_line)
+            
+            if len(line_text) > 50:
+                lines.append(' '.join(current_line[:-1]))
+                current_line = [word]
+        
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        y_offset = 300
+        for line in lines[:4]:
+            if font_body:
+                draw.text((100, y_offset), line, fill='#ECEFF4', font=font_body)
+            else:
+                draw.text((100, y_offset), line, fill='#ECEFF4')
+            y_offset += 80
+        
+        image_path = os.path.join(self.temp_dir, f"slide_{scene_num}.png")
+        img.save(image_path)
+        return image_path
+    
+    def _create_chart(self, key_points):
+        if not key_points or len(key_points) == 0:
+            key_points = ["Data Point 1", "Data Point 2", "Data Point 3"]
+            
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        categories = [f"Point {i+1}" for i in range(len(key_points))]
+        values = [len(str(point).split()) for point in key_points]
+        
+        ax.bar(categories, values, color='#5E81AC')
+        ax.set_title("Key Points Analysis", fontsize=16, color='#2E3440')
+        ax.set_ylabel("Word Count", fontsize=12)
+        
+        plt.tight_layout()
+        
+        chart_path = os.path.join(self.temp_dir, f"chart_{len(key_points)}.png")
+        plt.savefig(chart_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return chart_path
+    
+    def _create_text_image(self, text):
+        img = Image.new('RGB', (1920, 1080), color='#3B4252')
+        draw = ImageDraw.Draw(img)
+        
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans.ttf", 50)
+        except:
+            font = None
+        
+        text_lines = self._wrap_text(text, 30)
+        y_start = 540 - (len(text_lines) * 30)
+        
+        for i, line in enumerate(text_lines):
+            x = 100
+            y = y_start + (i * 60)
+            if font:
+                draw.text((x, y), line, fill='#ECEFF4', font=font)
+            else:
+                draw.text((x, y), line, fill='#ECEFF4')
+        
+        image_path = os.path.join(self.temp_dir, f"text_{abs(hash(text))}.png")
+        img.save(image_path)
+        return image_path
+    
+    def _wrap_text(self, text, chars_per_line):
+        words = text.split()
+        lines = []
+        current_line = []
+        
+        for word in words:
+            if len(' '.join(current_line + [word])) <= chars_per_line:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+        if current_line:
+            lines.append(' '.join(current_line))
+        return lines
+
+    def audio_agent(self, script_data):
+        full_script = script_data.get('hook', '') + ' '
+        for scene in script_data.get('scenes', []):
+            full_script += scene.get('narration', '') + ' '
+        full_script += script_data.get('conclusion', '')
+        if not full_script.strip():
+            full_script = "This is a generated video about the requested topic."
+        try:
+            tts = gTTS(text=full_script, lang='en', slow=False)
+            audio_path = os.path.join(self.temp_dir, 'narration.mp3')
+            tts.save(audio_path)
+            estimated_duration = len(full_script.split()) * 60 / 150
+            return audio_path, estimated_duration
+        except Exception as e:
+            st.error(f"Audio generation error: {e}")
+            return None, 0
+
+    def assembly_agent(self, script_data, visuals, audio_path):
+        try:
+            if not self.ffmpeg_available:
+                st.error("FFmpeg not available. Cannot create video.")
+                return None
+            
+            filelist_path = os.path.join(self.temp_dir, 'filelist.txt')
+            clip_paths = []
+            for i, visual in enumerate(visuals):
+                output_clip = os.path.join(self.temp_dir, f'clip_{i}.mp4')
+                cmd = [
+                    'ffmpeg', '-y', '-loop', '1', '-i', visual['image_path'],
+                    '-t', str(visual['duration']), '-pix_fmt', 'yuv420p',
+                    '-r', '24', output_clip
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    clip_paths.append(output_clip)
+                else:
+                    st.error(f"Error creating clip {i}: {result.stderr}")
+                    return None
+            
+            with open(filelist_path, 'w') as f:
+                for clip_path in clip_paths:
+                    f.write(f"file '{clip_path}'\n")
+            
+            video_no_audio = os.path.join(self.temp_dir, 'video_no_audio.mp4')
+            concat_cmd = [
+                'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', filelist_path,
+                '-c', 'copy', video_no_audio
+            ]
+            result = subprocess.run(concat_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                st.error(f"Error concatenating videos: {result.stderr}")
+                return None
+            
+            output_path = os.path.join(self.temp_dir, 'final_video.mp4')
+            if audio_path and os.path.exists(audio_path):
+                final_cmd = [
+                    'ffmpeg', '-y', '-i', video_no_audio, '-i', audio_path,
+                    '-c:v', 'copy', '-c:a', 'aac', '-shortest', output_path
+                ]
+                result = subprocess.run(final_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    st.error(f"Error adding audio: {result.stderr}")
+                    shutil.copy2(video_no_audio, output_path)
+            else:
+                shutil.copy2(video_no_audio, output_path)
+            
+            if os.path.exists(output_path):
+                return output_path
+            else:
+                st.error("Final video file not created")
+                return None
+                
+        except Exception as e:
+            st.error(f"Video assembly error: {e}")
+            return None
+
+def main():
+    # --- CHANGE 1: Updated Title ---
+    st.title("📹 YouTube Video Generation with RAG")
+    conn = get_db_connection()
+    if "processed_videos" not in st.session_state:
+        st.session_state.processed_videos = get_processed_videos(conn) if conn else []
+
+    tab1, tab2, tab3, tab4 = st.tabs(["Process Content", "Generate Video", "Processed Video Library", "Chat with Docs"])
+
+    # --- Tab 1: Process Content ---
+    with tab1:
+        st.subheader("Process a PDF or Web Link")
+        uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
+        if uploaded_file and st.button("Process PDF"):
+            if conn:
+                success, doc_id, title, size = process_pdf_file(uploaded_file, conn)
+                if success:
+                    st.success(f"PDF '{title}' processed successfully!")
+                    st.session_state.processed_videos.append((doc_id, title))
+                else:
+                    st.error("Failed to process PDF.")
+            else:
+                st.error("Database connection failed. Check your connection details.")
+
+        st.markdown("---")
+        # --- CHANGE 2: Removed 'Or' from text input label ---
+        web_url = st.text_input("Enter a Web Page URL")
+        if web_url and st.button("Process Web Content"):
+            if conn:
+                with st.spinner("Extracting and processing web content..."):
+                    success, doc_id, title, size = process_web_content(web_url, conn)
+                    if success:
+                        st.success(f"Web content processed successfully!")
+                        st.session_state.processed_videos.append((doc_id, title))
+                    else:
+                        st.error("Failed to process web content.")
+            else:
+                st.error("Database connection failed. Check your connection details.")
+        
+    # --- Tab 2: Generate Video ---
+    with tab2:
+        st.subheader("Generate a Video from Processed Content")
+        if st.session_state.processed_videos:
+            topic = st.text_input("Enter the topic for your video")
+            duration = st.selectbox("Select video duration:", ["1-2 minutes", "3-5 minutes", "5-10 minutes"])
+            visual_style = st.selectbox("Select visual style:", ["slides", "charts", "text"])
+
+            if st.button("Generate Script & Video"):
+                if conn:
+                    with st.spinner("Generating video script..."):
+                        embeddings = get_embeddings()
+                        vectorstore = OracleVS(
+                            client=conn,
+                            table_name="video_chunks",
+                            embedding_function=embeddings,
+                            distance_strategy=DistanceStrategy.COSINE
+                        )
+                        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+                        llm = ChatGoogleGenerativeAI(
+                            model=GEMINI_MODEL,
+                            temperature=0.7,
+                            convert_system_message_to_human=True
+                        )
+                        qa_chain = RetrievalQA.from_chain_type(
+                            llm=llm,
+                            chain_type="stuff",
+                            retriever=retriever,
+                            return_source_documents=True
+                        )
+                        video_agent = VideoCreationAgents(qa_chain)
+                        script_data = video_agent.script_agent(topic, duration)
+                        
+                        if script_data:
+                            st.subheader("Generated Script:")
+                            st.write(script_data)
+                            
+                            st.info("Agent 2: Creating visuals...")
+                            visuals = video_agent.visual_agent(script_data, visual_style)
+                            st.success(f"Generated {len(visuals)} visual elements")
+                            
+                            st.info("Agent 3: Creating narration...")
+                            audio_path, estimated_duration = video_agent.audio_agent(script_data)
+                            if audio_path:
+                                st.success(f"Audio generated (~{estimated_duration:.1f} seconds)")
+                            else:
+                                st.warning("Audio generation failed, creating video without sound")
+                            
+                            st.info("Agent 4: Assembling final video...")
+                            video_path = video_agent.assembly_agent(script_data, visuals, audio_path)
+                            
+                            if video_path and os.path.exists(video_path):
+                                st.success("Video created successfully!")
+                                st.video(video_path)
+                                with open(video_path, 'rb') as f:
+                                    st.download_button(
+                                        label="Download Video",
+                                        data=f.read(),
+                                        file_name=f"{topic.replace(' ', '_')}.mp4",
+                                        mime="video/mp4"
+                                    )
+                                file_size = os.path.getsize(video_path) / (1024*1024)
+                                st.info(f"File size: {file_size:.1f} MB")
+                            else:
+                                st.error("Video creation failed")
+                        else:
+                            st.error("Script generation failed.")
+                else:
+                    st.error("Database connection failed.")
+        else:
+            st.info("Please process a PDF or web link in the 'Process Content' tab before generating a video.")
+
+    # --- Tab 3: Processed Video Library ---
+    with tab3:
+        st.subheader("Processed Video Library")
+        if st.session_state.processed_videos:
+            for video_id, title in st.session_state.processed_videos:
+                col1, col2 = st.columns([0.8, 0.2])
+                with col1:
+                    st.info(f"**Title:** {title} (ID: {video_id})")
+                with col2:
+                    if st.button("Delete", key=f"delete_{video_id}"):
+                        if conn:
+                            if delete_document_safe(conn, video_id):
+                                st.session_state.processed_videos = get_processed_videos(conn)
+                                st.rerun()
+                        else:
+                            st.error("Database connection failed.")
+        else:
+            st.info("No documents have been processed yet. Process a file in the 'Process Content' tab.")
+
+    # --- Tab 4: Chat with Docs ---
+    with tab4:
+        st.subheader("Chat with your documents")
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+        
+        qa_chain = None
+        if conn:
+            try:
+                embeddings = get_embeddings()
+                vectorstore = OracleVS(
+                    client=conn,
+                    table_name="video_chunks",
+                    embedding_function=embeddings,
+                    distance_strategy=DistanceStrategy.COSINE
+                )
+                retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+                llm = ChatGoogleGenerativeAI(
+                    model=GEMINI_MODEL,
+                    temperature=0.1,
+                    convert_system_message_to_human=True
+                )
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=llm,
+                    chain_type="stuff",
+                    retriever=retriever,
+                    return_source_documents=True
+                )
+            except Exception as e:
+                st.warning(f"Could not initialize QA chain: {e}")
+        else:
+            st.warning("Database connection failed. Check your connection details.")
+        
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        if prompt := st.chat_input("Ask a question about the processed documents."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            with st.chat_message("assistant"):
+                if qa_chain:
+                    with st.spinner("Thinking..."):
+                        response = qa_chain({"query": prompt})
+                        full_response = response['result']
+                        source_documents = response.get('source_documents', [])
+                        
+                        if source_documents:
+                            source_info = "### Sources\n"
+                            for doc in source_documents:
+                                source_info += f"- **Document:** {doc.metadata.get('title', 'N/A')}\n"
+                            full_response += f"\n\n{source_info}"
+                        
+                    st.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                else:
+                    st.info("QA chain is not available. Please process a document first.")
+
+if __name__ == '__main__':
+    main()
