@@ -1,0 +1,244 @@
+##############cat new104.py   START OF SCRIPT##########################
+##################HOW TO execute  ~/.local/bin/streamlit run new104.py  #########################
+# final_fix_form.py - The definitive fix using st.form for robust state management
+import streamlit as st
+import tempfile
+import os
+import oracledb
+import uuid
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings.oracleai import OracleEmbeddings
+from langchain_community.vectorstores.oraclevs import OracleVS, DistanceStrategy
+from langchain.chains import RetrievalQA
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# --- Configuration ---
+VECTOR_TABLE_NAME = "DOC_CHUNKS"
+DOCUMENTS_TABLE_NAME = "DOCUMENTS"
+EMBEDDING_MODEL_NAME_IN_DB = "MINILM_EMBEDDING_MODEL"
+LLM_MODEL = "gemini-1.5-flash"
+
+# --- Database Connection and Functions ---
+@st.cache_resource
+def get_db_connection(username, password, dsn):
+    """Establishes and returns a connection to the Oracle Database."""
+    try:
+        connection = oracledb.connect(user=username, password=password, dsn=dsn)
+        return connection
+    except oracledb.Error as e:
+        st.error(f"Database connection failed: {e}")
+        return None
+
+def create_embeddings_and_store(file_path, original_filename, connection, username):
+    """
+    Loads PDF, chunks it, creates embeddings, and stores them in Oracle DB.
+    """
+    try:
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        chunks = text_splitter.split_documents(documents)
+        
+        embedder_params = {
+            "provider": "database",
+            "model": EMBEDDING_MODEL_NAME_IN_DB,
+        }
+
+        embedding_model = OracleEmbeddings(conn=connection, params=embedder_params)
+        
+        doc_id = str(uuid.uuid4()).replace('-', '').upper()[:32]
+        with connection.cursor() as cursor:
+            sql = f"INSERT INTO {username}.{DOCUMENTS_TABLE_NAME} (id, filename) VALUES (HEXTORAW(:1), :2)"
+            cursor.execute(sql, [doc_id, original_filename])
+        connection.commit()
+        
+        for chunk in chunks:
+            chunk.metadata['doc_id'] = doc_id
+
+        oracle_vs = OracleVS.from_documents(
+            chunks,
+            embedding_model,
+            client=connection,
+            table_name=f"{username}.{VECTOR_TABLE_NAME}",
+            distance_strategy=DistanceStrategy.COSINE,
+        )
+        
+        st.success(f"PDF '{original_filename}' processed and embeddings saved to Oracle Database!")
+        return True
+    except Exception as e:
+        st.error(f"Error during embedding and storage: Unexpected error: {e}")
+        return False
+
+def list_uploaded_pdfs(connection, username):
+    """Retrieves a list of all uploaded PDF filenames and their IDs from the database."""
+    try:
+        with connection.cursor() as cursor:
+            sql = f"SELECT filename, RAWTOHEX(id) FROM {username}.{DOCUMENTS_TABLE_NAME}"
+            cursor.execute(sql)
+            return cursor.fetchall()
+    except Exception as e:
+        st.error(f"Error fetching PDF list: {e}")
+        return []
+
+def delete_document_and_embeddings(doc_id, connection, username):
+    """Deletes a document and its associated vector embeddings from the database."""
+    try:
+        with connection.cursor() as cursor:
+            delete_chunks_sql = f"DELETE FROM {username}.{VECTOR_TABLE_NAME} WHERE JSON_VALUE(metadata, '$.doc_id') = :1"
+            cursor.execute(delete_chunks_sql, [doc_id])
+
+            delete_doc_sql = f"DELETE FROM {username}.{DOCUMENTS_TABLE_NAME} WHERE id = HEXTORAW(:1)"
+            cursor.execute(delete_doc_sql, [doc_id])
+        
+        connection.commit()
+        st.success(f"Document and embeddings for ID {doc_id} deleted successfully!")
+    except Exception as e:
+        st.error(f"Error deleting document: {e}")
+
+# --- Streamlit UI and Logic ---
+st.title("📄 RAG based chatbot for Oracle21c Knowledge base with Oracle 23ai and Gemini")
+
+# Access credentials from st.secrets
+if "database" not in st.secrets:
+    st.error("Please configure your Oracle database credentials in .streamlit/secrets.toml")
+    st.stop()
+if "google" not in st.secrets:
+    st.error("Please provide your Google AI API key in .streamlit/secrets.toml")
+    st.stop()
+    
+db_user = st.secrets["database"]["username"]
+db_password = st.secrets["database"]["password"]
+db_dsn = st.secrets["database"]["dsn"]
+google_api_key = st.secrets["google"]["api_key"]
+
+# Set API key as an environment variable for LangChain
+os.environ["GOOGLE_API_KEY"] = google_api_key
+
+# Establish a connection and cache it
+if 'conn' not in st.session_state:
+    st.session_state.conn = get_db_connection(db_user, db_password, db_dsn)
+    st.session_state.uploaded_docs = []
+
+if st.session_state.conn is None:
+    st.info("Failed to connect to the database. Please check credentials in secrets.toml.")
+    st.stop()
+
+# --- 1. Uploading PDFs and creating embeddings using a form ---
+st.subheader("1. Upload and Embed PDF")
+with st.form(key='pdf_upload_form'):
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file", 
+        type="pdf"
+    )
+    file_name_input = st.text_input(
+        "Enter a filename to save the document as (e.g., my_document.pdf)",
+        placeholder="e.g. my_document.pdf"
+    )
+    
+    submit_button = st.form_submit_button("Process and Embed PDF")
+
+    if submit_button:
+        if uploaded_file and file_name_input:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+                temp_file.write(uploaded_file.read())
+                temp_file_path = temp_file.name
+
+            with st.spinner(f"Processing '{file_name_input}' and creating embeddings..."):
+                success = create_embeddings_and_store(temp_file_path, file_name_input, st.session_state.conn, db_user)
+            
+            if success:
+                st.success(f"PDF '{file_name_input}' processed and embeddings saved!")
+                # Update the session state list after a successful upload
+                st.session_state.uploaded_docs = list_uploaded_pdfs(st.session_state.conn, db_user)
+            
+            os.unlink(temp_file_path)
+            # st.rerun() is not needed inside a form, but can be added if needed for a full page refresh
+        else:
+            st.warning("Please upload a PDF file and enter a filename.")
+
+# --- 2. Chatbot Interface ---
+st.subheader("2. Ask Questions")
+if 'qa_chain' not in st.session_state:
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=LLM_MODEL,
+            temperature=0.2,
+            convert_system_message_to_human=True
+        )
+        
+        embedder_params = {
+            "provider": "database",
+            "model": EMBEDDING_MODEL_NAME_IN_DB,
+        }
+        
+        embedding_model = OracleEmbeddings(conn=st.session_state.conn, params=embedder_params)
+        
+        oracle_vs = OracleVS(
+            client=st.session_state.conn,
+            table_name=f"{db_user}.{VECTOR_TABLE_NAME}",
+            embedding_function=embedding_model
+        )
+
+        retriever = oracle_vs.as_retriever(search_kwargs={"k": 5})
+
+        st.session_state.qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=True
+        )
+    except Exception as e:
+        st.error(f"Error creating QA chain. Have you uploaded a PDF? Error: {e}")
+
+if st.session_state.get('qa_chain'):
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask a question about the PDF..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.spinner("Generating response..."):
+            response = st.session_state.qa_chain.invoke({"query": prompt})
+        
+        with st.chat_message("assistant"):
+            st.markdown(response["result"])
+        
+        st.session_state.messages.append({"role": "assistant", "content": response["result"]})
+
+# --- 3. Manage Uploaded PDFs ---
+st.subheader("3. Manage Uploaded PDFs")
+
+# Check if the document list is in session state and not empty
+if not st.session_state.get('uploaded_docs'):
+    st.session_state.uploaded_docs = list_uploaded_pdfs(st.session_state.conn, db_user)
+    
+if not st.session_state.uploaded_docs:
+    st.info("No PDF documents have been uploaded yet.")
+else:
+    st.write("Current uploaded documents:")
+    for filename, doc_id in st.session_state.uploaded_docs:
+        col1, col2 = st.columns([0.8, 0.2])
+        with col1:
+            st.write(filename)
+        with col2:
+            if st.button("Delete", key=f"delete_{doc_id}"):
+                delete_document_and_embeddings(doc_id, st.session_state.conn, db_user)
+                # Manually update the document list in session state after a deletion
+                st.session_state.uploaded_docs = list_uploaded_pdfs(st.session_state.conn, db_user)
+                st.session_state.messages = []
+                st.rerun()
+################################## END OF SCRIPT #################################
+

@@ -1,0 +1,478 @@
+################cat rag35_new2.py   START OF SCRIPT ###########################
+##################HOW TO execute  ~/.local/bin/streamlit run rag35_new2.py  #########################
+import os
+import uuid
+import asyncio
+import streamlit as st
+import oracledb
+from yt_dlp import YoutubeDL
+import whisper
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.vectorstores import OracleVS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.schema import Document
+
+# -------------------------------
+# Configuration
+# -------------------------------
+GEMINI_MODEL = "gemini-1.5-pro"
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+
+# -------------------------------
+# Database Connection
+# -------------------------------
+@st.cache_resource
+def get_db_connection():
+    return oracledb.connect(
+        user="sample",
+        password="Summer2025",
+        dsn="localhost:1521/freepdb1"
+    )
+
+# -------------------------------
+# Initialize Embeddings (cached) - Fixed for Streamlit
+# -------------------------------
+@st.cache_resource
+def get_embeddings():
+    """Initialize embeddings with proper event loop handling"""
+    try:
+        # Try to get the current event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("Event loop is closed")
+    except RuntimeError:
+        # Create new event loop if none exists
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+# -------------------------------
+# Save Transcript into Oracle
+# -------------------------------
+def save_document(conn, doc_id, video_id, title, text):
+    cur = conn.cursor()
+    try:
+        # Ensure text is properly handled as CLOB
+        cur.execute(
+            """
+            INSERT INTO documents_new (doc_id, video_id, title, content)
+            VALUES (:1, :2, :3, :4)
+            """,
+            (doc_id, video_id, title, text)
+        )
+        conn.commit()
+        st.success("✅ Document saved to database")
+    except Exception as e:
+        st.error(f"❌ Error saving document: {str(e)}")
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+# -------------------------------
+# Create/Update Vector Store with Document Chunks - Fixed
+# -------------------------------
+def create_vector_store(conn, doc_id, video_id, title, text):
+    """Create vector embeddings for the document and store in OracleVS"""
+    try:
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""]
+        )
+        chunks = text_splitter.split_text(text)
+        
+        st.info(f"📄 Created {len(chunks)} chunks for vector storage")
+        
+        # Create documents with metadata
+        documents = []
+        for i, chunk in enumerate(chunks):
+            doc = Document(
+                page_content=chunk,
+                metadata={
+                    "doc_id": doc_id,
+                    "video_id": video_id,
+                    "title": title,
+                    "chunk_index": i,
+                    "source": f"YouTube Video: {title}"
+                }
+            )
+            documents.append(doc)
+        
+        # Get embeddings with proper async handling
+        def run_with_event_loop():
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+            return embeddings
+        
+        embeddings = run_with_event_loop()
+        
+        # Create or update vector store
+        table_name = "video_chunks"
+        
+        try:
+            # Try to add to existing vector store
+            vectorstore = OracleVS(
+                client=conn,
+                table_name=table_name,
+                embedding_function=embeddings
+            )
+            vectorstore.add_documents(documents)
+            st.success("✅ Added to existing vector store")
+        except Exception as e1:
+            try:
+                # Create new vector store if it doesn't exist
+                st.info("Creating new vector store...")
+                vectorstore = OracleVS.from_documents(
+                    documents,
+                    embeddings,
+                    client=conn,
+                    table_name=table_name
+                )
+                st.success("✅ Created new vector store")
+            except Exception as e2:
+                st.error(f"❌ Failed to create vector store: {str(e2)}")
+                st.error(f"Original error: {str(e1)}")
+                return False
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error creating vector store: {str(e)}")
+        import traceback
+        st.error(f"Full traceback: {traceback.format_exc()}")
+        return False
+
+# -------------------------------
+# Get All Processed Videos
+# -------------------------------
+def get_processed_videos(conn):
+    """Get list of all processed videos from database"""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT doc_id, video_id, title, 
+                   SUBSTR(content, 1, 200) as preview,
+                   LENGTH(content) as content_length
+            FROM documents_new 
+            ORDER BY ROWNUM DESC
+        """)
+        videos = []
+        for row in cur.fetchall():
+            doc_id, video_id, title, preview, content_length = row
+            # Convert LOB to string if needed
+            if hasattr(preview, 'read'):
+                preview = preview.read()
+            # Ensure preview is a string
+            preview = str(preview) if preview else ""
+            videos.append((doc_id, video_id, title, preview, content_length))
+        
+        cur.close()
+        return videos
+    except Exception as e:
+        st.error(f"Error fetching videos: {str(e)}")
+        return []
+
+# -------------------------------
+# RAG Question Answering - Fixed
+# -------------------------------
+def answer_question(conn, question):
+    """Answer question using RAG over all processed videos"""
+    try:
+        # Create embeddings with proper event loop handling
+        def get_embeddings_sync():
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            return GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        
+        embeddings = get_embeddings_sync()
+        
+        # Connect to existing vector store
+        vectorstore = OracleVS(
+            client=conn,
+            table_name="video_chunks",
+            embedding_function=embeddings
+        )
+        
+        # Create retriever
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 5}  # Get top 5 relevant chunks
+        )
+        
+        # Create LLM
+        llm = ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL,
+            temperature=0.2,
+            convert_system_message_to_human=True
+        )
+        
+        # Create QA chain
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=True,
+            verbose=True
+        )
+        
+# Get answer
+        result = qa_chain.invoke({"query": question})
+        
+        return result["result"], result["source_documents"]
+        
+    except Exception as e:
+        st.error(f"❌ Error answering question: {str(e)}")
+        import traceback
+        st.error(f"Full traceback: {traceback.format_exc()}")
+        return None, None
+
+# -------------------------------
+# Download YouTube Audio (with unique filenames)
+# -------------------------------
+def download_youtube_audio(url, output_dir="/tmp"):
+    st.info("📥 Downloading YouTube video...")
+    
+    # Generate unique identifier for this download
+    unique_id = str(uuid.uuid4())[:8]  # Short unique ID
+    
+    ydl_opts = {
+        "format": "bestaudio/best",
+        # Use unique filename with timestamp and unique ID
+        "outtmpl": os.path.join(output_dir, f"video_{unique_id}_%(id)s.%(ext)s"),
+        "cookiefile": "/home/oracle/cookies.txt",  # export from browser
+    }
+    
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        
+        # Construct the actual filename that was created
+        video_id = info["id"]
+        ext = info["ext"]
+        filename = f"video_{unique_id}_{video_id}.{ext}"
+        full_path = os.path.join(output_dir, filename)
+        
+        st.info(f"📄 Downloaded as: {filename}")
+        
+    return full_path, info.get("title", "Unknown Title"), video_id
+
+# -------------------------------
+# Transcribe with Whisper
+# -------------------------------
+def transcribe_audio(file_path):
+    st.info("⏳ Transcribing audio with Whisper...")
+    model = whisper.load_model("small")
+    result = model.transcribe(file_path)
+    return result["text"]
+
+# -------------------------------
+# Clean up old video files (optional)
+# -------------------------------
+def cleanup_old_videos(output_dir="/tmp", keep_recent=3):
+    """Keep only the most recent N video files to save disk space"""
+    try:
+        # Find all video files
+        video_files = []
+        for file in os.listdir(output_dir):
+            if file.startswith("video_") and any(file.endswith(ext) for ext in ['.webm', '.mp4', '.m4a', '.mp3']):
+                full_path = os.path.join(output_dir, file)
+                video_files.append((full_path, os.path.getctime(full_path)))
+        
+        # Sort by creation time (newest first)
+        video_files.sort(key=lambda x: x[1], reverse=True)
+        
+        # Delete old files, keep only recent ones
+        deleted_count = 0
+        for file_path, _ in video_files[keep_recent:]:
+            try:
+                os.remove(file_path)
+                deleted_count += 1
+            except:
+                pass
+        
+        if deleted_count > 0:
+            st.info(f"🗑️ Cleaned up {deleted_count} old video files")
+            
+    except Exception as e:
+        st.warning(f"Cleanup warning: {e}")
+
+# -------------------------------
+# Main App
+# -------------------------------
+def main():
+    st.title("🎥 YouTube Video RAG with OracleDB")
+    
+    # Initialize session state
+    if "processed_videos" not in st.session_state:
+        st.session_state.processed_videos = []
+    
+    # Create tabs
+    tab1, tab2, tab3 = st.tabs(["📥 Process Video", "💬 RAG Q&A", "📚 Video Library"])
+    
+    # Get database connection
+    conn = get_db_connection()
+    
+    # ===================
+    # TAB 1: Process Video
+    # ===================
+    with tab1:
+        st.subheader("📥 Process New Video")
+        
+        # Add cleanup option
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            url = st.text_input("Enter YouTube URL:")
+        with col2:
+            if st.button("🗑️ Cleanup Old Files"):
+                cleanup_old_videos()
+        
+        if st.button("Process Video") and url:
+            try:
+                with st.spinner("Processing video..."):
+                    # Step 1: Download with unique filename
+                    audio_file, title, video_id = download_youtube_audio(url)
+                    
+                    # Step 2: Transcribe
+                    text = transcribe_audio(audio_file)
+                    
+                    # Step 3: Save to database
+                    doc_id = str(uuid.uuid4())  # Always unique
+                    save_document(conn, doc_id, video_id, title, text)
+                    
+                    # Step 4: Create vector embeddings
+                    with st.spinner("Creating vector embeddings..."):
+                        vector_success = create_vector_store(conn, doc_id, video_id, title, text)
+                    
+                    if vector_success:
+                        st.success("✅ Video processed successfully!")
+                        
+                        # Show results
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("📄 DOC_ID", doc_id[:8] + "...")
+                        with col2:
+                            st.metric("🎥 VIDEO_ID", video_id)
+                        with col3:
+                            st.metric("📊 Text Length", f"{len(text):,} chars")
+                        
+                        # Step 5: Show Preview
+                        st.subheader("📄 Transcript Preview")
+                        with st.expander("View Transcript"):
+                            st.write(text[:2000] + "..." if len(text) > 2000 else text)
+                        
+                        st.info(f"📁 Audio file: {os.path.basename(audio_file)}")
+                        
+                        # Refresh processed videos list
+                        st.session_state.processed_videos = get_processed_videos(conn)
+                        
+                        # Optional: Clean up after processing
+                        # os.remove(audio_file)  # Uncomment to auto-delete after processing
+                    
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+    
+    # ===================
+    # TAB 2: RAG Q&A
+    # ===================
+    with tab2:
+        st.subheader("💬 Ask Questions About Your Videos")
+        
+        # Check if we have any processed videos
+        videos = get_processed_videos(conn)
+        
+        if not videos:
+            st.warning("⚠️ No videos processed yet. Please process a video first in the 'Process Video' tab.")
+        else:
+            st.success(f"✅ Ready to answer questions from {len(videos)} processed video(s)")
+            
+            # Question input
+            question = st.text_input(
+                "Ask a question about your videos:",
+                placeholder="e.g., What are the main topics discussed? Who are the speakers mentioned?"
+            )
+            
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                ask_button = st.button("🔍 Get Answer", type="primary")
+            with col2:
+                show_sources = st.checkbox("Show sources", value=True)
+            
+            if ask_button and question:
+                with st.spinner("🤔 Searching through your videos..."):
+                    answer, sources = answer_question(conn, question)
+                
+                if answer:
+                    st.subheader("💡 Answer")
+                    st.write(answer)
+                    
+                    if show_sources and sources:
+                        st.subheader("📚 Sources")
+                        for i, doc in enumerate(sources, 1):
+                            with st.expander(f"Source {i}: {doc.metadata.get('title', 'Unknown')}"):
+                                st.write("**Content:**")
+                                st.write(doc.page_content)
+                                st.write("**Metadata:**")
+                                st.json(doc.metadata)
+                
+            # Sample questions
+            st.subheader("💡 Sample Questions")
+            sample_questions = [
+                "What are the main topics discussed in the videos?",
+                "Who are the key people mentioned?",
+                "What are the important concepts explained?",
+                "Can you summarize the key points?",
+                "What recommendations or advice were given?"
+            ]
+            
+            for i, sample_q in enumerate(sample_questions):
+                if st.button(f"📝 {sample_q}", key=f"sample_{i}"):
+                    st.session_state.question_input = sample_q
+                    st.rerun()
+    
+    # ===================
+    # TAB 3: Video Library
+    # ===================
+    with tab3:
+        st.subheader("📚 Processed Video Library")
+        
+        videos = get_processed_videos(conn)
+        
+        if not videos:
+            st.info("📭 No videos processed yet.")
+        else:
+            st.info(f"📊 Total processed videos: {len(videos)}")
+            
+            # Display videos in a nice format
+            for video in videos:
+                doc_id, video_id, title, preview, content_length = video
+                
+                with st.expander(f"🎥 {title}"):
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        st.write("**Preview:**")
+                        # Safely handle preview text
+                        preview_text = str(preview) if preview else "No preview available"
+                        st.write(preview_text + "...")
+                        
+                    with col2:
+                        st.metric("📊 Content Length", f"{content_length:,} chars")
+                        st.code(f"DOC_ID: {doc_id}")
+                        st.code(f"VIDEO_ID: {video_id}")
+
+if __name__ == "__main__":
+    main()
+####################### END OF SCRIPT ########################

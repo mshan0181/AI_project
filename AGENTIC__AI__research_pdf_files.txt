@@ -1,0 +1,513 @@
+
+######### cat all_doc_process6.py___WORKING__PERFECT
+#########################python3.11 ~/.local/bin/streamlit run all_doc_process6.py####################
+import streamlit as st
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.embeddings import HuggingFaceEmbeddings
+import tempfile
+import os
+from typing import List, Dict
+import PyPDF2
+import docx
+import google.generativeai as genai
+import json
+
+# Configure Gemini
+def setup_gemini(api_key: str):
+    """Setup Gemini Flash 2.5 model"""
+    try:
+        genai.configure(api_key=api_key)
+        
+        # Try Gemini Flash 2.5 models
+        model_names = [
+            'gemini-2.0-flash-exp',
+            'gemini-1.5-flash-latest',
+            'gemini-1.5-flash',
+            'gemini-1.5-pro'
+        ]
+        
+        for model_name in model_names:
+            try:
+                test_model = genai.GenerativeModel(model_name)
+                # Test the model
+                test_response = test_model.generate_content(
+                    "Hello", 
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=10,
+                        temperature=0.1
+                    )
+                )
+                st.session_state.gemini_model = test_model
+                st.session_state.gemini_model_name = model_name
+                st.success(f"Connected to Gemini model: {model_name}")
+                return test_model
+            except Exception as e:
+                continue
+        
+        st.error("No Gemini models accessible. Check API key.")
+        return None
+        
+    except Exception as e:
+        st.error(f"Gemini setup failed: {str(e)}")
+        return None
+
+def analyze_documents_with_gemini(query: str, document_chunks: List[Dict]) -> Dict:
+    """Use Gemini to analyze document content and answer queries"""
+    if not hasattr(st.session_state, 'gemini_model') or not st.session_state.gemini_model:
+        return {"error": "Gemini model not available"}
+    
+    try:
+        # Prepare document context
+        context_text = ""
+        for i, chunk in enumerate(document_chunks[:10]):  # Limit to 10 chunks for context
+            source = chunk.get('metadata', {}).get('source', 'Unknown')
+            content = chunk.get('content', '')
+            context_text += f"\n[Document: {source}]\n{content[:800]}...\n"
+        
+        # Create analysis prompt
+        prompt = f"""
+        You are an expert document analyst. Analyze the following documents and answer the user's query comprehensively.
+
+        User Query: "{query}"
+
+        Document Content:
+        {context_text}
+
+        Instructions:
+        1. Provide a comprehensive answer to the user's query based on the document content
+        2. Cite specific documents when referencing information
+        3. Identify key themes and insights across documents
+        4. Point out any contradictions or gaps in the information
+        5. Suggest follow-up questions or areas for further research
+        6. Be specific about which documents contain relevant information
+
+        Please structure your response with:
+        - Direct Answer
+        - Key Findings from Documents
+        - Document Sources Used
+        - Additional Insights
+        - Recommendations
+        """
+        
+        response = st.session_state.gemini_model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=2000,
+                temperature=0.3
+            )
+        )
+        
+        return {
+            "analysis": response.text,
+            "model_used": st.session_state.gemini_model_name,
+            "documents_analyzed": len(document_chunks),
+            "query": query,
+            "success": True
+        }
+        
+    except Exception as e:
+        return {"error": f"Gemini analysis failed: {str(e)}", "success": False}
+
+def summarize_documents_with_gemini(processed_files: List[Dict]) -> Dict:
+    """Create a comprehensive summary of all processed documents using Gemini"""
+    if not hasattr(st.session_state, 'gemini_model') or not st.session_state.gemini_model:
+        return {"error": "Gemini model not available"}
+    
+    try:
+        # Get sample content from each document
+        docs_summary = st.session_state.vectorstore.similarity_search("", k=20)
+        
+        # Group by source document
+        doc_content = {}
+        for doc in docs_summary:
+            source = doc.metadata.get('source', 'Unknown')
+            if source not in doc_content:
+                doc_content[source] = []
+            doc_content[source].append(doc.page_content[:500])
+        
+        # Create summary for each document
+        summaries = {}
+        for source, contents in doc_content.items():
+            combined_content = "\n".join(contents[:5])  # First 5 chunks per document
+            
+            prompt = f"""
+            Summarize this document comprehensively:
+            
+            Document: {source}
+            Content: {combined_content}
+            
+            Provide:
+            1. Main topics covered
+            2. Key insights and findings
+            3. Important data or statistics mentioned
+            4. Conclusions or recommendations
+            5. Document type and purpose
+            
+            Keep the summary concise but informative (200-400 words).
+            """
+            
+            response = st.session_state.gemini_model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=500,
+                    temperature=0.2
+                )
+            )
+            
+            summaries[source] = response.text
+        
+        # Create overall synthesis
+        all_summaries = "\n\n".join([f"**{source}:**\n{summary}" for source, summary in summaries.items()])
+        
+        synthesis_prompt = f"""
+        Create a comprehensive synthesis of these document summaries:
+        
+        {all_summaries}
+        
+        Provide:
+        1. Overarching themes across all documents
+        2. Connections and relationships between documents
+        3. Contradictions or conflicting information
+        4. Combined insights and conclusions
+        5. Gaps in information
+        6. Potential research directions
+        
+        Structure this as an executive summary that gives someone a complete overview of the document collection.
+        """
+        
+        synthesis_response = st.session_state.gemini_model.generate_content(
+            synthesis_prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=1000,
+                temperature=0.3
+            )
+        )
+        
+        return {
+            "individual_summaries": summaries,
+            "synthesis": synthesis_response.text,
+            "model_used": st.session_state.gemini_model_name,
+            "documents_processed": len(summaries),
+            "success": True
+        }
+        
+    except Exception as e:
+        return {"error": f"Document summarization failed: {str(e)}", "success": False}
+
+def process_multiple_documents(uploaded_files) -> bool:
+    """
+    Process multiple uploaded documents and create/update vectorstore
+    """
+    if not uploaded_files:
+        st.warning("No files uploaded")
+        return False
+    
+    try:
+        # Initialize embeddings
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        
+        # Initialize text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+        )
+        
+        all_documents = []
+        processed_files = []
+        
+        # Process each uploaded file
+        for file_idx, uploaded_file in enumerate(uploaded_files):
+            st.info(f"Processing file {file_idx + 1}/{len(uploaded_files)}: {uploaded_file.name}")
+            
+            try:
+                # Extract text based on file type
+                text_content = extract_text_from_file(uploaded_file)
+                
+                if text_content:
+                    # Split text into chunks
+                    chunks = text_splitter.split_text(text_content)
+                    
+                    # Create documents with metadata
+                    for chunk_idx, chunk in enumerate(chunks):
+                        document = {
+                            'page_content': chunk,
+                            'metadata': {
+                                'source': uploaded_file.name,
+                                'file_index': file_idx,
+                                'chunk_index': chunk_idx,
+                                'file_type': uploaded_file.type,
+                                'total_chunks': len(chunks)
+                            }
+                        }
+                        all_documents.append(document)
+                    
+                    processed_files.append({
+                        'name': uploaded_file.name,
+                        'chunks': len(chunks),
+                        'size': uploaded_file.size
+                    })
+                    
+                    st.success(f"✅ Processed {uploaded_file.name}: {len(chunks)} chunks")
+                else:
+                    st.warning(f"⚠️ Could not extract text from {uploaded_file.name}")
+                    
+            except Exception as e:
+                st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
+                continue
+        
+        if not all_documents:
+            st.error("No documents were successfully processed")
+            return False
+        
+        # Create vectorstore from all documents
+        st.info(f"Creating vectorstore from {len(all_documents)} document chunks...")
+        
+        # Convert to format expected by FAISS
+        texts = [doc['page_content'] for doc in all_documents]
+        metadatas = [doc['metadata'] for doc in all_documents]
+        
+        # Create vectorstore
+        vectorstore = FAISS.from_texts(
+            texts=texts,
+            embedding=embeddings,
+            metadatas=metadatas
+        )
+        
+        # Store in session state
+        st.session_state.vectorstore = vectorstore
+        st.session_state.processed_files = processed_files
+        st.session_state.total_chunks = len(all_documents)
+        
+        # Display summary
+        st.success(f"🎉 Successfully processed {len(processed_files)} files with {len(all_documents)} total chunks")
+        
+        # Show processing summary
+        with st.expander("📋 Processing Summary"):
+            for file_info in processed_files:
+                st.write(f"**{file_info['name']}**: {file_info['chunks']} chunks ({file_info['size']} bytes)")
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"Error in document processing: {str(e)}")
+        return False
+
+def extract_text_from_file(uploaded_file) -> str:
+    """Extract text from various file types"""
+    try:
+        file_type = uploaded_file.type
+        
+        if file_type == "application/pdf":
+            return extract_pdf_text(uploaded_file)
+        elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            return extract_docx_text(uploaded_file)
+        elif file_type == "text/plain":
+            return str(uploaded_file.read(), "utf-8")
+        else:
+            # Try to read as text
+            try:
+                return str(uploaded_file.read(), "utf-8")
+            except:
+                st.warning(f"Unsupported file type: {file_type}")
+                return ""
+                
+    except Exception as e:
+        st.error(f"Error extracting text: {str(e)}")
+        return ""
+
+def extract_pdf_text(uploaded_file) -> str:
+    """Extract text from PDF"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+        
+        text = ""
+        with open(tmp_file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page_num, page in enumerate(pdf_reader.pages):
+                page_text = page.extract_text()
+                text += f"\n--- Page {page_num + 1} ---\n{page_text}"
+        
+        os.unlink(tmp_file_path)
+        return text
+        
+    except Exception as e:
+        st.error(f"Error reading PDF: {str(e)}")
+        return ""
+
+def extract_docx_text(uploaded_file) -> str:
+    """Extract text from DOCX"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+        
+        doc = docx.Document(tmp_file_path)
+        text = ""
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + "\n"
+        
+        os.unlink(tmp_file_path)
+        return text
+        
+    except Exception as e:
+        st.error(f"Error reading DOCX: {str(e)}")
+        return ""
+
+def enhanced_document_search(query: str) -> Dict:
+    """Enhanced document search that works with multiple documents"""
+    if not hasattr(st.session_state, 'vectorstore') or not st.session_state.vectorstore:
+        return {"error": "No documents uploaded"}
+    
+    try:
+        docs = st.session_state.vectorstore.similarity_search(query, k=10)
+        
+        results_by_file = {}
+        for doc in docs:
+            source = doc.metadata.get('source', 'Unknown')
+            if source not in results_by_file:
+                results_by_file[source] = []
+            results_by_file[source].append({
+                'content': doc.page_content,
+                'metadata': doc.metadata
+            })
+        
+        file_stats = st.session_state.get('processed_files', [])
+        
+        return {
+            "query": query,
+            "relevant_chunks": [{"content": doc.page_content, "metadata": doc.metadata} for doc in docs],
+            "results_by_file": results_by_file,
+            "files_searched": len(results_by_file),
+            "chunks_found": len(docs),
+            "total_files_processed": len(file_stats),
+            "total_chunks_available": st.session_state.get('total_chunks', 0),
+            "source": "Multi-Document Search"
+        }
+        
+    except Exception as e:
+        return {"error": f"Document search failed: {str(e)}"}
+
+def main():
+    st.title("Multi-Document AI Research Assistant with Gemini Flash 2.5")
+    
+    # API Key input
+    with st.sidebar:
+        st.header("🔑 API Configuration")
+        gemini_api_key = st.text_input(
+            "Gemini API Key",
+            type="password",
+            help="Enter your Google Gemini API key"
+        )
+        
+        if gemini_api_key and not hasattr(st.session_state, 'gemini_model'):
+            setup_gemini(gemini_api_key)
+    
+    # File upload section
+    with st.sidebar:
+        st.header("📄 Document Upload")
+        uploaded_files = st.file_uploader(
+            "Upload multiple documents",
+            type=['pdf', 'docx', 'txt'],
+            accept_multiple_files=True,
+            help="Upload PDF, DOCX, or TXT files for analysis"
+        )
+        
+        if uploaded_files:
+            if st.button("🔄 Process All Documents"):
+                with st.spinner("Processing documents..."):
+                    success = process_multiple_documents(uploaded_files)
+                    if success:
+                        st.rerun()
+        
+        # Show processed files
+        if hasattr(st.session_state, 'processed_files'):
+            st.subheader("📚 Processed Documents")
+            for file_info in st.session_state.processed_files:
+                st.write(f"✅ {file_info['name']} ({file_info['chunks']} chunks)")
+    
+    # Main interface
+    if hasattr(st.session_state, 'vectorstore'):
+        st.success("Documents processed and ready for analysis!")
+        
+        # Document Summary Tab
+        tab1, tab2, tab3 = st.tabs(["📊 Document Summary", "🔍 Query Documents", "📋 Search Results"])
+        
+        with tab1:
+            st.subheader("AI-Powered Document Analysis")
+            
+            if st.button("Generate Document Summary with Gemini"):
+                if hasattr(st.session_state, 'gemini_model'):
+                    with st.spinner("Analyzing documents with Gemini..."):
+                        summary_result = summarize_documents_with_gemini(st.session_state.processed_files)
+                        
+                        if summary_result.get('success'):
+                            st.subheader("📄 Individual Document Summaries")
+                            for source, summary in summary_result['individual_summaries'].items():
+                                with st.expander(f"Summary: {source}"):
+                                    st.write(summary)
+                            
+                            st.subheader("🔄 Cross-Document Synthesis")
+                            st.write(summary_result['synthesis'])
+                            
+                            st.info(f"Analysis completed using {summary_result['model_used']}")
+                        else:
+                            st.error(summary_result.get('error', 'Summary generation failed'))
+                else:
+                    st.warning("Please configure Gemini API key first")
+        
+        with tab2:
+            st.subheader("Ask Questions About Your Documents")
+            
+            query = st.text_input("Enter your question:", placeholder="What are the main findings in these documents?")
+            
+            if query and st.button("Analyze with Gemini"):
+                if hasattr(st.session_state, 'gemini_model'):
+                    with st.spinner("Searching and analyzing documents..."):
+                        # First, search for relevant documents
+                        search_results = enhanced_document_search(query)
+                        
+                        if search_results.get('relevant_chunks'):
+                            # Then analyze with Gemini
+                            analysis_result = analyze_documents_with_gemini(query, search_results['relevant_chunks'])
+                            
+                            if analysis_result.get('success'):
+                                st.subheader("🤖 Gemini Analysis")
+                                st.write(analysis_result['analysis'])
+                                
+                                st.info(f"Analysis based on {analysis_result['documents_analyzed']} document chunks using {analysis_result['model_used']}")
+                            else:
+                                st.error(analysis_result.get('error', 'Analysis failed'))
+                        else:
+                            st.warning("No relevant documents found for your query")
+                else:
+                    st.warning("Please configure Gemini API key first")
+        
+        with tab3:
+            st.subheader("Document Search")
+            
+            search_query = st.text_input("Search documents:", placeholder="Enter search terms...")
+            
+            if search_query:
+                search_results = enhanced_document_search(search_query)
+                
+                if search_results.get('relevant_chunks'):
+                    st.write(f"Found {search_results['chunks_found']} relevant chunks from {search_results['files_searched']} files")
+                    
+                    for i, chunk in enumerate(search_results['relevant_chunks'][:5]):
+                        with st.expander(f"Result {i+1} - {chunk['metadata'].get('source', 'Unknown')}"):
+                            st.write(chunk['content'])
+                else:
+                    st.warning("No relevant documents found")
+    else:
+        st.info("Upload and process documents to begin analysis")
+
+if __name__ == "__main__":
+    main()
+
+
