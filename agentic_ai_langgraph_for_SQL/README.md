@@ -51,21 +51,21 @@ The interactive web app where you can input natural language and see generated S
 agentic-mysql-ai/
 │
 
-├── gradio_agentic_ui.py        # Gradio frontend for user interaction
+├── gradio_agentic_ui.py                # Gradio frontend for user interaction
 
-├── langgraph_schema_graph.py   # LangGraph workflow (core logic)
+├── langgraph_schema_graph.py           # LangGraph workflow (core logic)
 
-├── mysql_mcp_server.py         # MCP server connecting to MySQL
+├── mysql_mcp_server.py                 # MCP server connecting to MySQL
 
-├── requirements.txt            # Dependencies
+├── requirements.txt                    # Dependencies
 
-├── run_all.sh                  # Shell script to launch everything
+├── run_all.sh                          # Shell script to launch everything
 
-├── verify_gemini.py            # Gemini API verification
+├── verify_gemini.py                    # Gemini API verification
 
-├── venv/                       # Virtual environment
+├── venv/                               # Virtual environment
 
-└── .env                        # API keys and MySQL credentials
+└── .env                                # API keys and MySQL credentials
 
 🧩 Setup Instructions
 -------------------------
