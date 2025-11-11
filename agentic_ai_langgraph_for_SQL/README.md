@@ -123,7 +123,7 @@ You can try:
 --------------------
 
 📘 Read the full implementation walkthrough and explanation on LinkedIn:
-👉 LinkedIn Article: Building an Agentic MySQL AI – Run SQL Operations via Natural Language
+👉 LinkedIn Article: https://www.linkedin.com/pulse/agentic-mysql-ai-executing-sql-database-natural-shanmugavelu-munivelu-2kflc/?trackingId=P9Q7fTvTc8Zo2b06vC3QOg%3D%3D
 
 💻 Tech Stack
 ----------------------
