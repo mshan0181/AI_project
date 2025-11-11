@@ -1,0 +1,19 @@
+{
+  "name": "real-agentic-ai-mcp",
+  "version": "2.0.0",
+  "description": "Real-Time Agentic AI with FREE Real APIs",
+  "type": "module",
+  "main": "real-agent.js",
+  "scripts": {
+    "start": "node real-agent.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "axios": "^1.7.9",
+    "nodemailer": "^6.9.16"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

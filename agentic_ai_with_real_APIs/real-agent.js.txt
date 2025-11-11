@@ -1,0 +1,334 @@
+#!/usr/bin/env node
+
+/**
+ * Real-Time Agentic AI with REAL FREE APIs
+ * Working examples with actual data!
+ */
+
+import Anthropic from '@anthropic-ai/sdk';
+import { spawn } from 'child_process';
+import readline from 'readline';
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+class MCPServerManager {
+  constructor(serverPath) {
+    this.serverPath = serverPath;
+    this.process = null;
+    this.tools = [];
+    this.requestId = 0;
+  }
+
+  async start() {
+    console.log('🚀 Starting Real API MCP Server...\n');
+    
+    this.process = spawn('node', [this.serverPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },
+    });
+
+    this.process.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg.includes('[MCP]')) {
+        console.log(`   ${msg}`);
+      }
+    });
+
+    this.process.on('exit', (code) => {
+      console.error(`[MCP Server] Exited with code ${code}`);
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await this.fetchTools();
+    
+    console.log(`\n✅ MCP Server ready with ${this.tools.length} real API tools!\n`);
+  }
+
+  async fetchTools() {
+    const request = {
+      jsonrpc: '2.0',
+      id: ++this.requestId,
+      method: 'tools/list',
+      params: {},
+    };
+
+    this.process.stdin.write(JSON.stringify(request) + '\n');
+
+    return new Promise((resolve) => {
+      const handler = (data) => {
+        try {
+          const response = JSON.parse(data.toString());
+          if (response.result?.tools) {
+            this.tools = response.result.tools;
+            this.process.stdout.removeListener('data', handler);
+            resolve();
+          }
+        } catch (e) {}
+      };
+      this.process.stdout.on('data', handler);
+    });
+  }
+
+  async callTool(toolName, toolInput) {
+    const request = {
+      jsonrpc: '2.0',
+      id: ++this.requestId,
+      method: 'tools/call',
+      params: { name: toolName, arguments: toolInput },
+    };
+
+    this.process.stdin.write(JSON.stringify(request) + '\n');
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Timeout')), 30000);
+      const handler = (data) => {
+        try {
+          const response = JSON.parse(data.toString());
+          if (response.id === request.id) {
+            clearTimeout(timeout);
+            this.process.stdout.removeListener('data', handler);
+            response.error ? reject(new Error(response.error.message)) : resolve(response.result);
+          }
+        } catch (e) {}
+      };
+      this.process.stdout.on('data', handler);
+    });
+  }
+
+  stop() {
+    if (this.process) this.process.kill();
+  }
+}
+
+class AgenticAI {
+  constructor(mcpManager) {
+    this.mcpManager = mcpManager;
+    this.conversationHistory = [];
+    this.systemPrompt = `You are an intelligent AI agent with access to REAL external APIs through MCP.
+
+Available tools:
+- Weather (OpenWeather): get_weather, get_forecast
+- News (NewsAPI): get_top_news, search_news
+- Currency (ExchangeRate): convert_currency, get_exchange_rates
+- GitHub: search_github_repos, get_github_user
+- Country Info (REST Countries): get_country_info
+- Cryptocurrency (CoinGecko): get_crypto_price, get_trending_crypto
+- Email (Gmail): send_email
+- Demo APIs: get_todos, create_post
+
+When users ask for real-time information, use these tools to provide ACTUAL data, not made-up information.
+
+Be helpful, accurate, and provide sources when using external data.`;
+  }
+
+  async processRequest(userMessage) {
+    console.log('\n🤖 Agent processing...\n');
+
+    this.conversationHistory.push({
+      role: 'user',
+      content: userMessage,
+    });
+
+    let continueLoop = true;
+    let finalResponse = '';
+
+    while (continueLoop) {
+      try {
+        // Convert MCP tools to Anthropic format
+        const anthropicTools = this.mcpManager.tools.map(tool => ({
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.inputSchema // MCP uses 'inputSchema', Anthropic expects 'input_schema'
+        }));
+
+        const response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          system: this.systemPrompt,
+          messages: this.conversationHistory,
+          tools: anthropicTools, // Use converted tools instead of this.mcpManager.tools
+        });
+
+        if (response.stop_reason === 'tool_use') {
+          const toolUses = response.content.filter((b) => b.type === 'tool_use');
+          const textBlock = response.content.find((b) => b.type === 'text');
+          
+          if (textBlock) {
+            console.log(`💭 ${textBlock.text}\n`);
+          }
+
+          this.conversationHistory.push({
+            role: 'assistant',
+            content: response.content,
+          });
+
+          const toolResults = [];
+          for (const toolUse of toolUses) {
+            console.log(`🔧 Using: ${toolUse.name}`);
+            
+            try {
+              const result = await this.mcpManager.callTool(toolUse.name, toolUse.input);
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: result.content[0].text,
+              });
+            } catch (error) {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: JSON.stringify({ success: false, error: error.message }),
+                is_error: true,
+              });
+            }
+          }
+
+          this.conversationHistory.push({
+            role: 'user',
+            content: toolResults,
+          });
+
+        } else if (response.stop_reason === 'end_turn') {
+          const textContent = response.content.find((b) => b.type === 'text');
+          if (textContent) {
+            finalResponse = textContent.text;
+          }
+          continueLoop = false;
+        } else {
+          continueLoop = false;
+        }
+
+      } catch (error) {
+        console.error(`❌ Error: ${error.message}`);
+        finalResponse = `Error: ${error.message}`;
+        continueLoop = false;
+      }
+    }
+
+    return finalResponse;
+  }
+
+  clearHistory() {
+    this.conversationHistory = [];
+  }
+}
+
+async function main() {
+  console.log('╔════════════════════════════════════════════════════╗');
+  console.log('║   Real-Time Agentic AI with FREE Real APIs        ║');
+  console.log('╚════════════════════════════════════════════════════╝\n');
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error('❌ Error: ANTHROPIC_API_KEY not set');
+    console.error('Set it with: export ANTHROPIC_API_KEY=your-key\n');
+    process.exit(1);
+  }
+
+  const mcpManager = new MCPServerManager('./real-mcp-server.js');
+  await mcpManager.start();
+
+  const agent = new AgenticAI(mcpManager);
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log('💡 Example commands (all use REAL APIs):');
+  console.log('   - "What\'s the weather in Tokyo?"');
+  console.log('   - "Show me top tech news"');
+  console.log('   - "Convert 100 USD to EUR"');
+  console.log('   - "What\'s the Bitcoin price?"');
+  console.log('   - "Search GitHub for python machine learning"');
+  console.log('   - "Tell me about Japan"\n');
+  console.log('   Type "demo" for automated examples\n');
+
+  const askQuestion = () => {
+    rl.question('\n👤 You: ', async (input) => {
+      const userInput = input.trim();
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      if (userInput.toLowerCase() === 'exit' || userInput.toLowerCase() === 'quit') {
+        console.log('\n👋 Goodbye!\n');
+        mcpManager.stop();
+        rl.close();
+        process.exit(0);
+      }
+
+      if (userInput.toLowerCase() === 'demo') {
+        await runDemo(agent);
+        askQuestion();
+        return;
+      }
+
+      if (userInput.toLowerCase() === 'clear') {
+        agent.clearHistory();
+        console.log('🗑️  History cleared');
+        askQuestion();
+        return;
+      }
+
+      try {
+        const response = await agent.processRequest(userInput);
+        console.log(`\n✨ ${response}\n`);
+      } catch (error) {
+        console.error(`\n❌ ${error.message}\n`);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+
+  process.on('SIGINT', () => {
+    console.log('\n\n👋 Shutting down...\n');
+    mcpManager.stop();
+    rl.close();
+    process.exit(0);
+  });
+}
+
+async function runDemo(agent) {
+  console.log('\n🎬 Running automated demo with real APIs...\n');
+  console.log('═'.repeat(60));
+
+  const demos = [
+    "What's the current weather in London?",
+    "Show me the top 3 technology news",
+    "What's the current Bitcoin price in USD?",
+    "Tell me about France - capital, population, and languages",
+  ];
+
+  for (let i = 0; i < demos.length; i++) {
+    console.log(`\nDemo ${i + 1}/${demos.length}: ${demos[i]}`);
+    console.log('─'.repeat(60));
+    
+    try {
+      const response = await agent.processRequest(demos[i]);
+      console.log(`\n✨ ${response}\n`);
+    } catch (error) {
+      console.error(`❌ ${error.message}`);
+    }
+
+    if (i < demos.length - 1) {
+      console.log('\n⏳ Next demo in 3 seconds...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+  }
+
+  console.log('═'.repeat(60));
+  console.log('\n✅ Demo complete! All data was REAL from live APIs!\n');
+  agent.clearHistory();
+}
+
+main().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
