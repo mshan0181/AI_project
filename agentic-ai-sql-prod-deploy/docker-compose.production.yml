@@ -1,0 +1,92 @@
+version: "3.8"
+networks:
+  proxy:
+  internal:
+
+volumes:
+  mysql_data:
+  nginx_certs:
+  nginx_vhost:
+  nginx_html:
+  nginx_acme:
+  nginx_dhparam:
+
+services:
+  nginx-proxy:
+    image: jwilder/nginx-proxy:latest
+    container_name: nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - nginx_certs:/etc/nginx/certs:ro
+      - nginx_vhost:/etc/nginx/vhost.d
+      - nginx_html:/usr/share/nginx/html
+      - nginx_dhparam:/etc/nginx/dhparam
+    networks:
+      - proxy
+
+  letsencrypt:
+    image: jrcs/letsencrypt-nginx-proxy-companion:latest
+    container_name: nginx-proxy-le
+    restart: unless-stopped
+    environment:
+      - DEFAULT_EMAIL=admin@YOUR_DOMAIN.com
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - nginx_certs:/etc/nginx/certs
+      - nginx_vhost:/etc/nginx/vhost.d
+      - nginx_html:/usr/share/nginx/html
+      - nginx_acme:/etc/acme.sh
+    networks:
+      - proxy
+    depends_on:
+      - nginx-proxy
+
+  mysql:
+    image: mysql:8.0
+    container_name: agentic_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-ai_agent_db}"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - internal
+
+  agentic-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: gradio
+    container_name: agentic_app
+    restart: unless-stopped
+    depends_on:
+      - mysql
+      - nginx-proxy
+      - letsencrypt
+    environment:
+      VIRTUAL_HOST: "ui.YOUR_DOMAIN.com"
+      LETSENCRYPT_HOST: "ui.YOUR_DOMAIN.com"
+      LETSENCRYPT_EMAIL: "admin@YOUR_DOMAIN.com"
+
+      MYSQL_HOST: "mysql"
+      MYSQL_USER: "root"
+      MYSQL_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-ai_agent_db}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL:-gemini-2.5-pro}"
+
+      LANGCHAIN_TRACING_V2: "true"
+      LANGCHAIN_API_KEY: "${LANGCHAIN_API_KEY}"
+      LANGCHAIN_PROJECT: "agentic-production"
+
+    expose:
+      - "7860"
+      - "8080"
+    networks:
+      - proxy
+      - internal
