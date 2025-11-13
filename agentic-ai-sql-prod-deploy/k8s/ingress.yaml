@@ -1,0 +1,35 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agentic-ingress
+  namespace: agentic
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+spec:
+  tls:
+    - hosts:
+        - ui.YOUR_DOMAIN.com
+      secretName: agentic-ui-tls
+  rules:
+    - host: ui.YOUR_DOMAIN.com
+      http:
+        paths:
+          - pathType: Prefix
+            path: /api(/|$)(.*)
+            backend:
+              service:
+                name: mcp-svc
+                port:
+                  number: 8080
+          - pathType: Prefix
+            path: /(.*)
+            backend:
+              service:
+                name: gradio-svc
+                port:
+                  number: 7860

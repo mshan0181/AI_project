@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gradio
+  namespace: agentic
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gradio
+  template:
+    metadata:
+      labels:
+        app: gradio
+    spec:
+      containers:
+        - name: gradio
+          image: your-registry/agentic-app:gradio-latest
+          ports:
+            - containerPort: 7860
+          env:
+            - name: MCP_URL
+              value: "http://mcp-svc:8080"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentic-secrets
+                  key: GEMINI_API_KEY
+            - name: LLM_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: agentic-config
+                  key: LLM_MODEL
+            - name: LANGCHAIN_TRACING_V2
+              value: "true"
+            - name: LANGCHAIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentic-secrets
+                  key: LANGCHAIN_API_KEY
+            - name: LANGCHAIN_PROJECT
+              value: "agentic-ui-production"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7860
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 7860
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gradio-svc
+  namespace: agentic
+spec:
+  selector:
+    app: gradio
+  ports:
+    - port: 7860
+      targetPort: 7860
+      name: http
+  type: ClusterIP

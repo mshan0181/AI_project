@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentic-config
+  namespace: agentic
+data:
+  MYSQL_DATABASE: "ai_agent_db"
+  LLM_MODEL: "gemini-2.5-pro"
+  PUBLIC_UI_HOST: "ui.YOUR_DOMAIN.com"
+  PUBLIC_API_HOST: "api.YOUR_DOMAIN.com"
