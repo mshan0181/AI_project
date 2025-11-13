@@ -1,0 +1,15 @@
+####cat run_all.sh
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+if [ ! -d "venv" ]; then
+  python3.11 -m venv venv
+fi
+source venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install --no-cache-dir -r requirements.txt
+set -a; [ -f .env ] && . .env; set +a
+python verify_gemini.py
+nohup uvicorn mysql_mcp_server:app --host 0.0.0.0 --port 8080 > mcp.log 2>&1 &
+sleep 4
+python gradio_agentic_ui.py

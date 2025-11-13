@@ -1,0 +1,11 @@
+####cat verify_gemini.py
+from langchain_google_genai import ChatGoogleGenerativeAI
+import os
+
+api_key = os.getenv("GEMINI_API_KEY") or input("🔑 Enter your Gemini API key: ")
+try:
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=api_key)
+    print("✅ Connected to Gemini 2.5 Pro successfully!\n")
+    print("💡 Test response:\n", llm.invoke("Generate SQL to list top 3 products by revenue").content)
+except Exception as e:
+    print("❌ Gemini connection failed:", e)
