@@ -60,7 +60,9 @@ Update schema graph
 ----------
 
 Update image
+
 docker build -t agentic-ai-mysql:latest .
+
 docker save -o agentic-ai-mysql.tar agentic-ai-mysql:latest
 
  Portable Deployment
@@ -69,8 +71,11 @@ docker save -o agentic-ai-mysql.tar agentic-ai-mysql:latest
 To deploy on another machine:
 
 tar -xzvf agentic-ai-mysql-portable.tar.gz
+
 docker load -i agentic-ai-mysql.tar
+
 cp .env.example .env
+
 docker compose up -d
 
 
@@ -91,9 +96,14 @@ This build:
 Folder Structure
 .
 ├── app/
+
 ├── docker-compose.yml
+
 ├── Dockerfile
+
 ├── agentic-ai-mysql.tar
+
 ├── .env.example
+
 └── README.md
 
