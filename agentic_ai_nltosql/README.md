@@ -17,15 +17,16 @@ Transform Natural Language → SQL automatically with:
  Quick Start
 -------------
 1) Clone the repo
-git clone https://github.com/<yourname>/agentic-ai-mysql.git
-cd agentic-ai-mysql
+git clone https://github.com/<yourname>/agentic_ai_nltosql.git
+cd agentic_ai_nltosql
+
 
 2) Edit environment variables
 cp .env.example .env
 nano .env
 
 3) Load AI image
-docker load -i agentic-ai-mysql.tar
+docker load -i agentic_ai_nltosql.tar
 
 4) Run full stack
 docker compose up -d
@@ -66,18 +67,18 @@ Update schema graph
 
 Update image
 
-docker build -t agentic-ai-mysql:latest .
+docker build -t agentic_ai_nltosql:latest .
 
-docker save -o agentic-ai-mysql.tar agentic-ai-mysql:latest
+docker save -o agentic_ai_nltosql.tar agentic_ai_nltosql:latest
 
  Portable Deployment
 ----------------------
 
 To deploy on another machine:
 
-tar -xzvf agentic-ai-mysql-portable.tar.gz
+tar -xzvf agentic_ai_nltosql.tar.gz
 
-docker load -i agentic-ai-mysql.tar
+docker load -i agentic_ai_nltosql.tar
 
 cp .env.example .env
 
@@ -111,7 +112,7 @@ Folder Structure
 
 ├── Dockerfile
 
-├── agentic-ai-mysql.tar
+├── agentic_ai_nltosql.tar
 
 ├── .env.example
 
