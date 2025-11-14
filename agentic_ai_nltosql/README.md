@@ -3,10 +3,15 @@
 Transform Natural Language → SQL automatically with:
 
 ✔ LangGraph
+
 ✔ Gemini 2.5 Pro
+
 ✔ FastAPI MCP Server
+
 ✔ Gradio UI
+
 ✔ MySQL backend
+
 ✔ SSL reverse proxy (nginx + Let’s Encrypt)
 
  Quick Start
@@ -87,10 +92,15 @@ Done.
 This build:
 
 ✔ Supports multiple users
+
 ✔ Auto-configures SSL
+
 ✔ Auto-detects schema
+
 ✔ Safe SQL generation (no destructive operations)
+
 ✔ Stateless — works on any MySQL backend
+
 ✔ Can be run on any cloud VM
 
 Folder Structure
